@@ -1,0 +1,12 @@
+ROUTINE RunScript
+RunScript
+ Do Run()
+ Quit
+Run()
+ Set startTime = $ZHOROLOG
+ Set gaia = ##class(%SYS.Python).Import("gaia")
+ Do gaia."run"()
+ Set endTime = $ZHOROLOG
+ Set elapsed = endTime - startTime
+ Write "Elapsed time: ", elapsed, " seconds", !
+ Quit
