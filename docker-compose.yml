@@ -6,6 +6,7 @@ services:
     restart: always
     environment:
       - ISC_CPF_MERGE_FILE=/home/irisowner/dev/merge.cpf
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     ports:
       - 1972
       - 52773

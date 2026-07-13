@@ -5,6 +5,8 @@ src/__pycache__/
 *.pyc
 *.log
 .github/
+iris.key
+*.whl
 
 data/temp/EpochPhotometry_003112-005263.csv
 data/temp/EpochPhotometry_005264-006601.csv
