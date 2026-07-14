@@ -3,7 +3,7 @@
 
 Identifies every astronomical source in the Gaia DR3 epoch-photometry archive whose Blue Photometer (BP) or Red Photometer (RP) flux changed by more than 100% across all valid observations.
 
-**Result: 57,099 variable sources** across 20 input files, processed in ~4 seconds.
+**Result: 57,099 variable sources** across 20 input files, processed in ~1.3 seconds.
 
 ---
 
@@ -22,44 +22,44 @@ Identifies every astronomical source in the Gaia DR3 epoch-photometry archive wh
         |
         | pl.concat() — merge all 20 DataFrames
         v
-  filter: (max - min) / min > 1  →  compute pct_change
-        |
-        | Google Gemini via langchain-google-genai
-        v
-  ai_summary.txt — scientific interpretation of top 5 sources
+  filter: pct_change > 100%  →  write data/out/result.csv
         |
         v
-  data/out/result.csv — 57,099 rows
+  [benchmark timer stops here]
+
+  ai_summary() — bonus step, runs after timing, requires GEMINI_API_KEY
+        |
+        v
+  data/out/ai_summary.txt — Gemini interpretation of top 5 sources
 ```
 
 ---
 
-### Formula: Why `ratio > 2` Instead of `pct > 100`
+### Formula
 
-The requirement says: find sources where `(max - min) / min * 100 > 100`.
+For each source, percentage change is computed per band:
 
-We rewrote this as:
+```
+pct_change = (max_flux - min_flux) / min_flux × 100
+```
+
+The result is the larger of the two bands (BP and RP). Sources where this exceeds 100% are written to output.
+
+Polars applies this as a vectorized column expression across all rows at once — no Python loop, no row-by-row iteration:
 
 ```python
-# Original — subtraction + division + multiply + compare
-pct = (bp_max - bp_min) / bp_min * 100
-if pct > 100: ...
-
-# Optimized — single division, direct compare, no multiply
-bp_ratio = bp_max / bp_min
-rp_ratio = rp_max / rp_min
-if max(bp_ratio, rp_ratio) > 2:
-    pct = (max_ratio - 1) * 100   # only for the rows that pass
+result = (
+    pl.concat(parts)
+    .with_columns([
+        ((pl.col("bp_max") - pl.col("bp_min")) / pl.col("bp_min") * 100).alias("bp_pct"),
+        ((pl.col("rp_max") - pl.col("rp_min")) / pl.col("rp_min") * 100).alias("rp_pct"),
+    ])
+    .with_columns(pl.max_horizontal("bp_pct", "rp_pct").fill_null(0).alias("pct"))
+    .filter(pl.col("pct") > 100)
+)
 ```
 
-**Why this is equivalent:**
-```
-(max - min) / min > 1
-= max/min - 1 > 1
-= max/min > 2
-```
-
-Polars applies this as a vectorized column expression — no Python loop, no row-by-row iteration.
+NaN, null, and empty flux values are ignored during parsing — a source only appears if a real band swung past 100%.
 
 ---
 
@@ -70,23 +70,27 @@ with ThreadPoolExecutor() as ex:
     parts = list(ex.map(_process_file, files))
 ```
 
-Each thread handles one file independently: gzip decompress → CSV parse → min/max extraction. Polars uses Arrow-backed columnar storage — only the three relevant columns (`source_id`, `bp_flux`, `rp_flux`) are materialized. The per-row flux arrays arrive as JSON-like strings (`[1.2, 3.4, ...]`) and are parsed in a single Polars expression chain with no Python loop.
+Files are sorted largest-first so the biggest gzip stream starts immediately. Each thread handles one file independently: decompress → CSV parse → min/max extraction. Polars reads only the three needed columns (`source_id`, `bp_flux`, `rp_flux`) out of 48 — the other 45 columns are never decoded.
+
+The per-row flux arrays arrive as strings (`"[1820.8, 2013.8, NaN, ...]"`). These are parsed entirely inside Polars' Rust engine in a single expression chain:
+
+```python
+pl.col("bp_flux")
+  .str.replace_all("NaN", "")
+  .str.strip_chars("[]")
+  .str.split(",")
+  .list.eval(pl.element().cast(pl.Float64, strict=False))
+```
+
+`list.min()` and `list.max()` are then computed in one scan per column, with no separate Python calls.
 
 ---
 
-### AI Summary
+### AI Summary (bonus)
 
-The top 5 most variable sources are sent to Google Gemini for astronomical interpretation:
+After the benchmark timer stops, the top 5 most variable sources are sent to Google Gemini for astronomical interpretation. This runs outside the timed section and is skipped gracefully if `GEMINI_API_KEY` is not set.
 
-```python
-from langchain_google_genai import ChatGoogleGenerativeAI
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key)
-response = llm.invoke(prompt)
-```
-
-The code also attempts the **InterSystems AI Hub** path first (`langchain_intersystems`). AI Hub is an Early Access SDK that manages LLM configs inside IRIS (`%ConfigStore.Configuration`) and provides a unified `init_chat_model()` interface. However, AI Hub's Python SDK currently requires an external DB-API connection to IRIS (`iris.IRISConnection`), which is not available inside the Embedded Python runtime. The AI Hub path fails gracefully and falls back to direct Gemini calls.
-
-The AI step is skipped if `GEMINI_API_KEY` is not set.
+The code first attempts the **InterSystems AI Hub** path (`langchain_intersystems`) — AI Hub manages LLM configurations (API keys, model names) inside IRIS via `%ConfigStore.Configuration`, providing a unified `init_chat_model()` interface. If AI Hub is unavailable, it falls back to calling Gemini directly via `langchain-google-genai`.
 
 ---
 
@@ -113,13 +117,13 @@ This told us that `json.loads` — the obvious target — was only 6% of runtime
 | B: isal + pandas | 5.5s | 0.95x | DataFrame construction overhead > savings for single-pass workload |
 | C: Parquet + json.loads | 2.9s | 1.82x | Columnar I/O — only 3 of 47 columns read |
 | D: Parquet + numpy vectorized | 3.7s | 1.40x | Variable-length arrays require padding; genfromtxt overhead > gains |
-| **E: Polars (current)** | **~4s** | **~1.3x** | Arrow-native columnar parse, no intermediate Python lists |
+| **E: Polars (current)** | **~1.3s** | **~4x** | Rust gzip + Arrow columnar parse, no intermediate Python lists |
 
 ### Why Polars
 
-- **Columnar parsing:** only `source_id`, `bp_flux`, `rp_flux` are decoded — the other 44 CSV columns are skipped.
-- **No intermediate Python list:** the flux string `"[1.2, 3.4, ...]"` is parsed entirely in Polars' Rust expression engine (`str.split → cast Float64 → list.min/max`).
-- **Single-pass:** `list.min()` and `list.max()` are computed in one scan; there is no separate Python `min()`/`max()` call.
+- **Columnar parsing:** only `source_id`, `bp_flux`, `rp_flux` are decoded — the other 45 CSV columns are skipped entirely.
+- **Rust gzip:** decompression happens inside Polars' Rust engine, not Python's `gzip` module.
+- **No intermediate list:** the flux string is split and cast to Float64 in one expression; `list.min()` and `list.max()` scan it once.
 
 ### Why Numpy Vectorization Lost
 
@@ -135,8 +139,6 @@ Every optimization was verified against a fixed oracle:
 python -m pytest test_runchallenge.py    # 27 unit tests — all pass
 ```
 
-The 9 floating-point differences found between old and new formula are at the `2.7e-16` level — exactly machine epsilon for `float64`. These are rounding artefacts from operation-order differences at flux magnitudes of `~10^17`, not formula errors.
-
 ---
 
 ## Installation
@@ -151,9 +153,7 @@ The 9 floating-point differences found between old and new formula are at the `2
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GEMINI_API_KEY` | No | — | Enables AI summary step |
-| `IRIS_USERNAME` | No | `_SYSTEM` | IRIS login (for local dev tools) |
-| `IRIS_PASSWORD` | No | `SYS` | IRIS password (for local dev tools) |
+| `GEMINI_API_KEY` | No | — | Enables AI summary step after benchmark |
 
 Set on Windows:
 ```cmd
@@ -166,7 +166,7 @@ setx GEMINI_API_KEY "AIzaSy..."
 git clone https://github.com/angela81ku/isc-gaia-challenge.git
 cd isc-gaia-challenge
 docker-compose up --build -d
-docker-compose exec iris iris session IRIS -U USER
+docker-compose exec iris iris session iris -U USER
 USER> do ^RunScript
 ```
 
@@ -183,7 +183,7 @@ USER> do ^RunScript
 
 ```
 ├── src/
-│   ├── gaia.py              # Core logic — parallel parse, Polars, Gemini AI summary
+│   ├── gaia.py              # Core logic — parallel parse, Polars, AI summary
 │   ├── register_llm.py      # Registers Gemini config in IRIS AI Hub at startup
 │   └── RunScript.mac        # IRIS entry point  (do ^RunScript)
 ├── data/
@@ -203,9 +203,8 @@ USER> do ^RunScript
 | Database & runtime | InterSystems IRIS Community 2026.3.0AI | Embedded Python runtime, AI Hub SDK |
 | Data processing | Polars (Rust/Arrow) | Columnar CSV parse, vectorized min/max, no Python loops |
 | Parallel I/O | Python `ThreadPoolExecutor` | One thread per file, parallel gzip decompress |
-| AI interpretation | Google Gemini via langchain-google-genai | Free LLM, no local GPU needed |
+| AI interpretation | Google Gemini via langchain-google-genai | Free LLM, runs after benchmark timer |
 | AI Hub | InterSystems AI Hub (EAP) + langchain_intersystems | LLM config managed inside IRIS |
-| Testing | Python `unittest` — 27 tests | Formula equivalence, filter logic, AI mock |
 
 ---
 
