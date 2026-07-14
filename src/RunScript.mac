@@ -3,10 +3,12 @@ RunScript
  Do Run()
  Quit
 Run()
+ ; --- timed section: pure data processing only ---
  Set startTime = $ZHOROLOG
  Set gaia = ##class(%SYS.Python).Import("gaia")
  Do gaia."run"()
- Set endTime = $ZHOROLOG
- Set elapsed = endTime - startTime
+ Set elapsed = $ZHOROLOG - startTime
  Write "Elapsed time: ", elapsed, " seconds", !
+ ; --- bonus: AI summary (outside timing, optional) ---
+ Do gaia."ai_summary"()
  Quit
