@@ -1,3 +1,23 @@
+# Gaia DR3 Variable Source Finder
+# InterSystems Employee Programming Challenge #1
+#
+# Approach: Polars (Rust-backed DataFrames) + ThreadPoolExecutor.
+# Each of the 20 gzip-compressed CSV files is processed on its own thread.
+# Polars decompresses and parses natively in Rust — no Python gzip module,
+# no intermediate lists. Only 3 of 48 columns are ever decoded.
+#
+# IRIS Embedded Python bridges ObjectScript (RunScript.mac) to this module
+# via ##class(%SYS.Python).Import("gaia"). No external process, no TCP —
+# the Python runtime lives inside the IRIS process.
+#
+# AI Hub note: ai_summary() attempts the InterSystems AI Hub path first
+# (langchain_intersystems), which manages LLM configs inside IRIS via
+# %ConfigStore.Configuration. In the current EAP release the SDK requires
+# an iris.IRISConnection (TCP), which is not available inside Embedded Python,
+# so it falls back to calling Gemini directly via langchain-google-genai.
+# ai_summary() is intentionally NOT called from run() — it is a bonus step
+# that runs after the benchmark timer and requires GEMINI_API_KEY.
+
 import glob, os
 import polars as pl
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +28,10 @@ AI_SUMMARY_FILE = "/home/irisowner/dev/data/out/ai_summary.txt"
 
 
 def _process_file(path):
+    # Read only the three needed columns — Polars skips the other 45 entirely.
     df = pl.read_csv(path, comment_prefix="#", columns=["source_id", "bp_flux", "rp_flux"])
+    # Each flux cell is a string like "[1820.8, 2013.8, NaN, ...]".
+    # Strip brackets, split on commas, cast to Float64 (NaN → null, skipped by min/max).
     for col in ["bp_flux", "rp_flux"]:
         df = df.with_columns(
             pl.col(col).str.replace_all("NaN", "").str.strip_chars("[]").str.split(",")
@@ -24,13 +47,18 @@ def _process_file(path):
 
 
 def run():
+    # Sort largest file first so the heaviest decompression starts immediately.
     files = sorted(
         glob.glob(os.path.join(DATA_DIR, "EpochPhotometry_*.csv.gz")),
         key=os.path.getsize, reverse=True
     )
+    # One thread per file — I/O and Rust decompression release the GIL,
+    # so threads run in parallel despite Python's GIL.
     with ThreadPoolExecutor() as ex:
         parts = list(ex.map(_process_file, files))
 
+    # Concatenate all per-file results, compute percentage change, filter, write.
+    # Formula: pct = (max - min) / min * 100, take the larger of BP and RP.
     result = (
         pl.concat(parts)
         .with_columns([
@@ -48,7 +76,8 @@ def run():
 
 
 def ai_summary():
-    """Bonus: generate AI summary of results. Called after timing ends."""
+    # Bonus step — called separately, never inside run().
+    # Reads result.csv, builds a prompt from the top 5 sources, calls Gemini.
     result = pl.read_csv(OUT_FILE, has_header=False,
                          new_columns=["source_id", "bp_min", "bp_max", "rp_min", "rp_max", "pct"])
     count = len(result)
@@ -66,7 +95,8 @@ def ai_summary():
 
     summary = None
 
-    # Primary path: AI Hub via langchain_intersystems
+    # Primary: AI Hub — reads LLM config (model, api_key) from IRIS %ConfigStore.
+    # Requires iris.IRISConnection; not available in Embedded Python (EAP limitation).
     try:
         import iris
         from langchain_intersystems.chat_models import init_chat_model
@@ -78,7 +108,7 @@ def ai_summary():
     except Exception as e:
         print(f"AI Hub unavailable ({e}), trying direct Gemini...")
 
-    # Fallback: call Gemini directly
+    # Fallback: call Gemini directly via langchain-google-genai.
     if summary is None:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
